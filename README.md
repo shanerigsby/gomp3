@@ -25,3 +25,7 @@ sudo systemctl enable gomp3.service
 
 check the recent logs:  
 journalctl -u gomp3.service -n 20 -r
+
+
+TODO:
+work out kinks in command line args. they should all be optional
