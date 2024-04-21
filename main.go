@@ -13,35 +13,45 @@ import (
 	"path/filepath"
 	"net/url"
 	"encoding/json"
+	"sort"
+	"time"
 )
 
 // sample config.json file:
 // {
 //     "port": "8100",
 //     "filesDir": "/home/user/mp3s",
-//     "execDir": "/home/user/downloads/yt-dlp",
-//     "outDir": "/home/user/mp3s"
+// 	   "dirSizeMaxMB": 200,
+//     "execDir": "/home/user/downloads/yt-dlp"
 // }
 
+type Config struct {
+	Port     string `json:"port"`
+	FilesDir string `json:"filesDir"`
+	DirSizeMaxMB int `json:"dirSizeMaxMB"`
+	ExecPath  string `json:"execDir"`
+}
 
 var filesDir string
 var execPath string
-var outDir string
+var limitBytes int64
 
 func main() {
 
+	// parsing command line arguments and/or config default values --
 	configFilePath := flag.String("c", "config.json", "path to json config file")
 	flag.Parse()
 	config, err := getConfig(*configFilePath)
 	if err != nil {
 		log.Fatal("Error getting config: %v\n", err)
 	}
-
 	port := flag.String("p", config.Port, "port to serve on")
 	flag.StringVar(&filesDir, "d", config.FilesDir, "the directory where files are hosted")
+	dirSizeMaxMB := flag.Int("m", config.DirSizeMaxMB, "maximum size of hosted directory")
 	flag.StringVar(&execPath, "e", config.ExecPath, "path of the yt-dlp executable")
-	flag.StringVar(&outDir, "o", config.OutDir, "directory to save mp3 output")
 	flag.Parse()
+	limitBytes = int64(*dirSizeMaxMB) * 1024 * 1024
+	// ---
 
 	// serve files from the path specified by filesDir arg or default
 	http.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir(filesDir))))
@@ -101,7 +111,7 @@ func handleMp3(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// call the yt-dlp executable with audio only mp3 options
-	outfile := filepath.Join(outDir, fmt.Sprintf("%s.mp3", videoID))
+	outfile := filepath.Join(filesDir, fmt.Sprintf("%s.mp3", videoID))
 	cmdArgs := []string{url, "-x", "--audio-format", "mp3", "-o", outfile}
 	cmd := exec.Command(execPath, cmdArgs...)
 	var out bytes.Buffer
@@ -116,6 +126,28 @@ func handleMp3(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, fmt.Sprintf("%s/%s/%s.mp3", r.Host, "files", videoID))
+
+	// manage hosting limit ---
+	totalSize, err := getTotalSize(filesDir)
+	if err != nil {
+		log.Println("Error:", err)
+		return
+	}
+
+	if totalSize > limitBytes {
+		oldestMP3File, err := getOldestMP3File(filesDir)
+		if err != nil {
+			log.Println("Error:", err)
+			return
+		}
+
+		log.Printf("Info: Folder size is %d bytes. Deleting: %s\n", totalSize, oldestMP3File)
+		err = os.Remove(oldestMP3File)
+		if err != nil {
+			log.Println("Error deleting file:", err)
+			return
+		}
+	}
 }
 
 func isValidURL(url string) bool {
@@ -162,12 +194,6 @@ func fileAlreadyExists(videoID string) bool {
 	}
 }
 
-type Config struct {
-	Port     string `json:"port"`
-	FilesDir string `json:"filesDir"`
-	ExecPath  string `json:"execDir"`
-	OutDir   string `json:"outDir"`
-}
 
 func getConfig(configFilePath string) (Config, error) {
 	var config Config
@@ -183,4 +209,59 @@ func getConfig(configFilePath string) (Config, error) {
 	}
 
 	return config, nil
+}
+
+// size of folder
+func getTotalSize(folderPath string) (int64, error) {
+	var totalSize int64
+
+	err := filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			totalSize += info.Size()
+		}
+		return nil
+	})
+
+	if err != nil {
+		return 0, err
+	}
+
+	return totalSize, nil
+}
+
+func getOldestMP3File(folderPath string) (string, error) {
+	var mp3Files []string
+
+	err := filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && filepath.Ext(info.Name()) == ".mp3" {
+			mp3Files = append(mp3Files, path)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	// Sort files by modification time (oldest first)
+	sort.Slice(mp3Files, func(i, j int) bool {
+		return getFileModTime(mp3Files[i]).Before(getFileModTime(mp3Files[j]))
+	})
+
+	if len(mp3Files) > 0 {
+		return mp3Files[0], nil
+	}
+
+	return "", fmt.Errorf("no MP3 files found")
+}
+
+func getFileModTime(filePath string) time.Time {
+	fileInfo, _ := os.Stat(filePath)
+	return fileInfo.ModTime()
 }
